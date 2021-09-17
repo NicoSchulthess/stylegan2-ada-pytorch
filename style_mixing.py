@@ -91,7 +91,7 @@ def generate_style_mix(
     print('Saving images...')
     os.makedirs(outdir, exist_ok=True)
     for (row_seed, col_seed), image in image_dict.items():
-        PIL.Image.fromarray(image, 'RGB').save(f'{outdir}/{row_seed}-{col_seed}.png')
+        PIL.Image.fromarray(image.squeeze()).save(f'{outdir}/{row_seed}-{col_seed}.png')
 
     print('Saving image grid...')
     W = G.img_resolution
@@ -106,7 +106,7 @@ def generate_style_mix(
                 key = (col_seed, col_seed)
             if col_idx == 0:
                 key = (row_seed, row_seed)
-            canvas.paste(PIL.Image.fromarray(image_dict[key], 'RGB'), (W * col_idx, H * row_idx))
+            canvas.paste(PIL.Image.fromarray(image_dict[key].squeeze()), (W * col_idx, H * row_idx))
     canvas.save(f'{outdir}/grid.png')
 
 
