@@ -8,6 +8,13 @@
 
 """Project given image to the latent space of pretrained network pickle."""
 
+import sys
+sys.path.append('.')
+
+from scripts.helpers import create_directory
+from tqdm import tqdm
+
+
 import copy
 import os
 from time import perf_counter
@@ -78,6 +85,10 @@ def project(
         buf[:] = torch.randn_like(buf)
         buf.requires_grad = True
 
+    distances = []
+    losses = []
+    lrs = []
+
     for step in range(num_steps):
         # Learning rate schedule.
         t = step / num_steps
@@ -86,6 +97,7 @@ def project(
         lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
         lr_ramp = lr_ramp * min(1.0, t / lr_rampup_length)
         lr = initial_learning_rate * lr_ramp
+        lrs.append(lr)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -121,6 +133,9 @@ def project(
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+
+        losses.append(float(loss))
+        distances.append(float(dist))
         logprint(f'step {step+1:>4d}/{num_steps}: dist {dist:<4.2f} loss {float(loss):<5.2f}')
 
         # Save projected W for each optimization step.
@@ -132,7 +147,7 @@ def project(
                 buf -= buf.mean()
                 buf *= buf.square().mean().rsqrt()
 
-    return w_out.repeat([1, G.mapping.num_ws, 1])
+    return w_out.repeat([1, G.mapping.num_ws, 1]), losses, distances, lrs
 
 #----------------------------------------------------------------------------
 
@@ -151,69 +166,120 @@ def run_projection(
     seed: int,
     num_steps: int
 ):
-    """Project given image to the latent space of pretrained network pickle.
 
-    Examples:
+    patient_indices = list(range(1, 101, 2))
+    slice_indices = list(range(0, 20, 2))
 
-    \b
-    python projector.py --outdir=out --target=~/mytargetimg.png \\
-        --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/ffhq.pkl
-    """
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    target_paths = []
+    for patient_index in patient_indices:
+        for phase in ['ES', 'ED']:
+            for slice_index in slice_indices:
+                target_name = f'patient{patient_index:03}_slice{slice_index:02}_{phase}.png'
+                target_path = os.path.join(target_fname, target_name)
+                if os.path.exists(target_path):
+                    target_paths.append(target_path)
 
-    # Load networks.
-    print('Loading networks from "%s"...' % network_pkl)
-    device = torch.device('cuda')
-    with dnnlib.util.open_url(network_pkl) as fp:
-        G = legacy.load_network_pkl(fp)['G_ema'].requires_grad_(False).to(device) # type: ignore
+    for target_fname in tqdm(target_paths):
 
-    # Load target image.
-    target_pil = PIL.Image.open(target_fname)
-    n_channels = len(target_pil.getbands())
-    w, h = target_pil.size
-    s = min(w, h)
-    target_pil = target_pil.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
-    target_pil = target_pil.resize((G.img_resolution, G.img_resolution), PIL.Image.LANCZOS)
-    if n_channels == 1:
-        target_uint8 = np.array(target_pil, dtype=np.uint8)[:,:,np.newaxis]
-    elif n_channels == 3:
-        target_uint8 = np.array(target_pil, dtype=np.uint8)
-    else:
-        print('Number of channels not in [1,3]')
-        return
+        """Project given image to the latent space of pretrained network pickle.
 
-    # Optimize projection.
-    start_time = perf_counter()
-    projected_w_steps = project(
-        G,
-        target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
-        num_steps=num_steps,
-        device=device,
-        verbose=True
-    )
-    print (f'Elapsed: {(perf_counter()-start_time):.1f} s')
+        Examples:
 
-    # Render debug output: optional video and projected image and W vector.
-    os.makedirs(outdir, exist_ok=True)
-    if save_video:
-        video = imageio.get_writer(f'{outdir}/proj.mp4', mode='I', fps=10, codec='libx264', bitrate='16M')
-        print (f'Saving optimization progress video "{outdir}/proj.mp4"')
-        for projected_w in projected_w_steps:
-            synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
-            synth_image = (synth_image + 1) * (255/2)
-            synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
-            video.append_data(np.concatenate([target_uint8, synth_image], axis=1))
-        video.close()
+        \b
+        python projector.py --outdir=out --target=~/mytargetimg.png \\
+            --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/ffhq.pkl
+        """
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
-    # Save final projected frame and W vector.
-    target_pil.save(f'{outdir}/target.png')
-    projected_w = projected_w_steps[-1]
-    synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
-    synth_image = (synth_image + 1) * (255/2)
-    synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
-    PIL.Image.fromarray(synth_image.squeeze()).save(f'{outdir}/proj.png')
-    np.savez(f'{outdir}/projected_w.npz', w=projected_w.unsqueeze(0).cpu().numpy())
+        # Load networks.
+        # print('Loading networks from "%s"...' % network_pkl)
+        device = torch.device('cuda')
+        with dnnlib.util.open_url(network_pkl) as fp:
+            G = legacy.load_network_pkl(fp)['G_ema'].requires_grad_(False).to(device) # type: ignore
+
+        # Load target image.
+        target_pil = PIL.Image.open(target_fname)
+        n_channels = len(target_pil.getbands())
+        w, h = target_pil.size
+        s = min(w, h)
+        target_pil = target_pil.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
+        target_pil = target_pil.resize((G.img_resolution, G.img_resolution), PIL.Image.LANCZOS)
+        if n_channels == 1:
+            target_uint8 = np.array(target_pil, dtype=np.uint8)[:,:,np.newaxis]
+        elif n_channels == 3:
+            target_uint8 = np.array(target_pil, dtype=np.uint8)
+        else:
+            print('Number of channels not in [1,3]')
+            return
+
+        # Optimize projection.
+        start_time = perf_counter()
+        projected_w_steps, losses, distances, lrs = project(
+            G,
+            target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
+            num_steps=num_steps,
+            device=device,
+            # verbose=True
+        )
+        print (f'Elapsed: {(perf_counter()-start_time):.1f} s')
+
+        target_image_name = '.'.join(target_fname.split('/')[-1].split('.')[:-1])
+
+        # Render debug output: optional video and projected image and W vector.
+        os.makedirs(outdir, exist_ok=True)
+        if save_video:
+            video = imageio.get_writer(f'{outdir}/{target_image_name}_proj{num_steps:04}.mp4', mode='I', fps=10, codec='libx264', bitrate='16M')
+            print (f'Saving optimization progress video "{outdir}/{target_image_name}_proj_{num_steps:04}.mp4"')
+            for projected_w in projected_w_steps:
+                synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
+                synth_image = (synth_image + 1) * (255/2)
+                synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
+                video.append_data(np.concatenate([target_uint8, synth_image], axis=1))
+            video.close()
+
+        # import matplotlib.pyplot as plt
+        #
+        #
+        # plt.figure(figsize=(16,9))
+        # plt.plot(distances)
+        # plt.savefig(f'{outdir}/{target_image_name}_distances_{num_steps:04}.png')
+        # plt.close()
+        #
+        #
+        # plt.figure(figsize=(16,9))
+        # plt.plot(lrs)
+        # plt.savefig(f'{outdir}/{target_image_name}_learning_rate_{num_steps:04}.png')
+        # plt.close()
+        #
+        # for i in range(0, projected_w_steps.shape[0], 10):
+        #     projected_w = projected_w_steps[i]
+        #     img_noise_const = G.synthesis(projected_w.unsqueeze(0), noise_mode='const').squeeze().cpu().numpy()
+        #     img_noise_random = G.synthesis(projected_w.unsqueeze(0)).squeeze().cpu().numpy()
+        #     plt.figure(figsize=(16,9))
+        #     plt.suptitle(f'Iteration {i}')
+        #     plt.subplot(1,3,1)
+        #     plt.title('Target')
+        #     plt.imshow(target_uint8, cmap='gray')
+        #     plt.subplot(1,3,2)
+        #     plt.title('Optimal Noise')
+        #     plt.imshow(img_noise_const, cmap='gray')
+        #     plt.subplot(1,3,3)
+        #     plt.title('Random Noise')
+        #     plt.imshow(img_noise_random, cmap='gray')
+        #     plt.savefig(f'{outdir}/{target_image_name}_{i:03}.png')
+        #     plt.close()
+        #
+        # Save final projected frame and W vector.
+        target_pil.save(f'{outdir}/{target_image_name}_target.png')
+        projected_w = projected_w_steps[-1]
+        synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
+        synth_image = (synth_image + 1) * (255/2)
+        synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
+        PIL.Image.fromarray(synth_image.squeeze()).save(f'{outdir}/{target_image_name}_proj_{num_steps:04}.png')
+        np.savez(f'{outdir}/{target_image_name}_projected_w_{num_steps:04}.npz', w=projected_w.unsqueeze(0).cpu().numpy())
+        # np.savez(f'{outdir}/{target_image_name}_losses_{num_steps:04}.npz', w=losses)
+        # np.savez(f'{outdir}/{target_image_name}_distances_{num_steps:04}.npz', w=distances)
 
 #----------------------------------------------------------------------------
 
